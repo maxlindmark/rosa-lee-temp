@@ -1,0 +1,443 @@
+---
+title: "Bias in temperature-estimates on growth due to Rosa Lee effect"
+author: "Max Lindmark"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    toc: true
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 80%
+editor: source
+execute: 
+  echo: true
+  eval: true
+  cache: false
+---
+
+In this script, we extend the basic model (rosa-lee-basic-example.qmd) to include: temperature time series and temperature effects on growth.
+
+```{r}
+#| message: false
+#| warning: false
+
+library(viridis)
+library(ggdist)
+library(patchwork)
+library(viridis)
+library(tidyverse)
+library(ggsidekick)
+library(purrr)
+library(broom)
+theme_set(theme_sleek())
+
+# Set path
+home <- here::here()
+```
+
+### Reload the basic parameters
+
+```{r}
+#| warning: false
+#| message: false
+
+# Model parameters
+set.seed(123)
+n_years <- 100
+n_ages <- 15
+n_platoons <- 250  # Number of growth morphs/platoons
+ages <- 0:(n_ages-1)
+
+# Life history parameters
+M <- 0.2           # Natural mortality
+steep <- 0.7       # Steepness
+R0 <- 1000         # Unfished recruitment (thousands)
+mat_age <- 3       # Age at 50% maturity
+mat_slope <- 0.5
+
+# Selectivity parameters (logistic)
+sel_age50 <- 4
+sel_slope <- 0.8
+
+# Growth parameters by platoon (von Bertalanffy)
+# Each platoon has different VBGE pars
+K_vals <- rnorm(n_platoons, mean = 0.3, sd = 0.1)
+
+growth_params <- tibble(
+  platoon = 1:n_platoons,
+  Linf = 80,
+  K = K_vals,
+  t0 = -0.5,
+  CV_old = 0.1,     # <! not used! Can use it for intra-platoon variability. 
+  prop = 1/n_platoons
+)
+
+# Length-weight parameters
+a_lw <- 0.01
+b_lw <- 3
+
+# Calculate length and weight at age for each platoon
+size_at_age <- growth_params |>
+  crossing(age = ages) |>
+  mutate(
+    length = Linf * (1 - exp(-K * (age - t0))),
+    weight = a_lw * length^b_lw
+  ) |> 
+  select(platoon, age, Linf, K, t0, CV_old, length, weight)
+
+# Maturity
+maturity <- tibble(age = ages) |>
+  mutate(
+    maturity = plogis((age - mat_age) / mat_slope)
+  )
+
+# Selectivity needs to be size-based for Rosa Lee to occur:
+L50_len <- 40   # length at 50% vulnerability (cm)
+len_slope <- 1  # slope (larger => gentler logistic)
+
+# Build length-based selectivity per platoon x age using size_at_age
+selectivity <- size_at_age |>
+  mutate(selectivity = plogis((length - L50_len) / len_slope)) |>
+  select(platoon, age, length, selectivity)
+
+# Get initial population values
+init_pop <- crossing(
+  year = 1,
+  age = ages,
+  platoon = 1:n_platoons
+) |>
+  left_join(growth_params |> select(platoon, prop), by = "platoon") |>
+  mutate(
+    # Unfished equilibrium age structure
+    N = R0 * prop * exp(-M * age),
+    N = if_else(age == max(age), N / (1 - exp(-M)), N)  # Plus group
+  ) |>
+  left_join(size_at_age, by = c("age", "platoon")) |>
+  left_join(maturity, by = "age") |> 
+  left_join(selectivity |> select(platoon, age, selectivity),
+            by = c("platoon", "age")) |>
+  mutate(selectivity = ifelse(is.na(selectivity), 0, selectivity))
+
+# Calculate unfished SSB (needed for S-R)
+SSB0 <- init_pop |>
+  mutate(SSB_contrib = N * weight * maturity) |>
+  summarise(SSB0 = sum(SSB_contrib)) |>
+  pull(SSB0)
+
+# Beverton-Holt stock-recruitment function
+# ss3 style! https://nmfs-ost.github.io/ss3-doc/SS330_User_Manual_release.html#BH
+beverton_holt <- function(SSB, R0, steep, SSB0) {
+  4 * steep * R0 * SSB / (SSB0 * (1 - steep) + SSB * (5 * steep - 1))
+}
+
+# Fishing mortality pattern (ramp up then stabilize)
+F_longterm <- 0.4
+F_pattern <- tibble(year = 1:n_years) |>
+  mutate(
+    F_mult = case_when(
+      year <= 5 ~ 0,           
+      year <= 15 ~ (year - 5) / 10 * F_longterm,
+      TRUE ~ F_longterm               
+    )
+  )
+
+# Also define the no-fishing scenario
+F_pattern_unfished <- tibble(year = 1:n_years, F_mult = 0)
+```
+
+### Update the basic model to handle temperature and temperature effects on $K$
+
+First, we need a temperature time series.
+
+```{r}
+# Build a warming series with noise. For simplicity, it's expressed as an anomaly.
+# The function takes length of time series, what the total warming should be, and the level of noise
+make_warming_series <- function(n_years, total_warming = 2, noise_sd = 0.5, seed = 42) {
+  set.seed(seed)
+  trend <- seq(0, total_warming, length.out = n_years)
+  eps <- rnorm(n_years, 0, noise_sd)
+  temp <- trend + eps
+  tibble(year = 1:n_years, temp = temp)
+}
+
+# Example: 2°C over n_years
+temp_series <- make_warming_series(n_years = n_years)
+# Plot temperature anomaly
+ggplot(temp_series, aes(year, temp)) + geom_line() +
+  labs(y = "Temperature anomaly relative to first year (°C)", x = "Year")
+
+# Also define a no-warming scenario
+temp_zero <- tibble(year = 1:n_years, temp = rep(0, n_years))
+```
+
+Update the population dynamics function to also takes a temperature time series, `deltaK_perC` (how much $K$ should change per degrees C), and a switch to turn on/off temperature effects on $K$.
+
+```{r}
+# Population dynamics simulation
+pop_dynamics_warming <- function(init_pop, n_years, M, R0, steep, SSB0, F_pattern,
+                                 growth_params, ages, temp_series = NULL,
+                                 temp_effect_on_K = FALSE, deltaK_perC = 0.1,
+                                 L50_len = 40, len_slope = 1, a_lw = 0.01, b_lw = 3) {
+  
+  # if NULL, assume zero anomaly (no warming)
+  if (is.null(temp_series)) temp_series <- tibble(year = 1:n_years, temp = 0)
+  stopifnot(nrow(temp_series) >= n_years)
+  
+  # Only keep dynamic columns in pop: year, age, platoon, N
+  pop <- init_pop |> dplyr::select(year, age, platoon, N, K)
+  
+  for (y in 2:n_years) {
+    
+    prev <- pop |> filter(year == y - 1)
+    
+    # Aggregate by age x platoon
+    prev_unique <- prev |>
+      summarise(N = sum(N), .by = c(age, platoon))
+    
+    # <! Here we deviate from the base model; adjust K for this year's temperature for each platoon
+    base_K_df <- growth_params |> dplyr::select(platoon, Linf, K, t0)
+    
+    temp_anom <- temp_series |> filter(year == y) |> pull(temp)
+    
+    if (temp_effect_on_K) {
+      base_K_df <- base_K_df |> mutate(K_adj = K + deltaK_perC * (temp_anom - temp_series$temp[1]))
+    } else {
+      base_K_df <- base_K_df |> mutate(K_adj = K)
+    }
+    # prevent negative Ks
+    base_K_df <- base_K_df |>
+      mutate(K_adj = if_else(K_adj < 1e-6, 1e-6, K_adj))
+    
+    # Build size-at-age for this year (platoon × age) using K_adj
+    # This is defined outside of the loop in the non-temperature version
+    size_at_age_year <- base_K_df |>
+      crossing(age = ages) |>
+      mutate(
+        length = Linf * (1 - exp(-K_adj * (age - t0))),
+        length = ifelse(is.nan(length) | is.infinite(length), 0, length),
+        weight = a_lw * length^b_lw
+      ) |> dplyr::select(platoon, age, Linf, K = K_adj, t0, length, weight)
+    
+    # Compute selectivity dynamically from size (length-based logistic)
+    selectivity_year <- size_at_age_year |>
+      mutate(selectivity = plogis((length - L50_len) / len_slope)) |>
+      dplyr::select(platoon, age, length, selectivity)
+    
+    # Join to prev_unique for SSB and selectivity
+    prev_unique2 <- prev_unique |>
+      left_join(size_at_age_year, by = c("age", "platoon")) |>
+      left_join(maturity, by = "age") |>
+      left_join(selectivity_year |> dplyr::select(-length), by = c("age", "platoon")) |>
+      mutate(selectivity = ifelse(is.na(selectivity), 0, selectivity))
+    
+    # <! back to basic model
+    
+    # Calculate SSB
+    SSB <- sum(prev_unique2$N * prev_unique2$weight * prev_unique2$maturity)
+    
+    # Recruitment
+    recruits <- beverton_holt(SSB, R0, steep, SSB0)
+    
+    # Fishing mortality (given input)
+    F_y <- F_pattern |> filter(year == y) |> pull(F_mult)
+    
+    # Apply mortality and age: use the selectivity and K for this year (selectivity was computed)
+    aged <- prev_unique2 |>
+      mutate(
+        F = F_y * selectivity,
+        Z = M + F,
+        N_aged = N * exp(-Z),
+        age = age + 1
+      )
+    
+    # Regular ages
+    new_year <- aged |>
+      filter(age < max(ages)) |>
+      summarise(N = sum(N_aged), .by = c(age, platoon)) |>
+      mutate(year = y)
+    
+    # Plus group: all fish that reach max age are accumulated there
+    plus_group <- aged |>
+      filter(age == max(ages)) |>
+      mutate(N = N_aged, year = y) |>
+      dplyr::select(year, age, platoon, N)
+    
+    # Recruit distribution: keep same platoon proportions (no heritability here)
+    recruits_df <- growth_params |>
+      dplyr::select(platoon, prop) |>
+      mutate(year = y, age = 0, N = recruits * prop)
+    
+    # Combine to form year's population
+    new_year <- bind_rows(new_year, plus_group, recruits_df)
+    
+    # Combine
+    new_year <- new_year |>
+      left_join(base_K_df |> dplyr::select(platoon, K_adj), by = "platoon") |>
+      rename(K = K_adj)
+    
+    pop <- bind_rows(pop, new_year) |>
+      dplyr::select(year, age, platoon, N, K)
+
+  }
+  
+  pop_out <- pop
+  list(pop = pop_out, temp_series = temp_series)
+}
+```
+
+### Run models with different combinations of underlying warming temperature-effects on $K$
+
+By default, we do 2°C warming spread out linearly over 100 years. DeltaK_perC is then 0.05/2 = 0.025.
+
+```{r}
+deltaK_perC <- 0.025
+
+# Create a named list of simulation outputs, one for each combination of fishing (on/off) X warming (on/off).
+scenarios <- list(
+  Unfished_NoWarming = pop_dynamics_warming(init_pop = init_pop, n_years = n_years, M = M,
+                                            R0 = R0, steep = steep, SSB0 = SSB0,
+                                            growth_params = growth_params, ages = ages,
+                                            temp_series = temp_zero, F_pattern = F_pattern_unfished,
+                                            temp_effect_on_K = FALSE, deltaK_perC = deltaK_perC),
+  
+  Fished_NoWarming = pop_dynamics_warming(init_pop = init_pop, n_years = n_years, M = M,
+                                          R0 = R0, steep = steep, SSB0 = SSB0,
+                                          growth_params = growth_params, ages = ages,
+                                          temp_series = temp_zero, F_pattern = F_pattern,
+                                          temp_effect_on_K = FALSE, deltaK_perC = deltaK_perC),
+  
+  Unfished_Warming = pop_dynamics_warming(init_pop = init_pop, n_years = n_years, M = M,
+                                          R0 = R0, steep = steep, SSB0 = SSB0,
+                                          growth_params = growth_params, ages = ages,
+                                          temp_series = temp_series, F_pattern = F_pattern_unfished,
+                                          temp_effect_on_K = TRUE, deltaK_perC = deltaK_perC),
+  
+  Fished_Warming = pop_dynamics_warming(init_pop = init_pop, n_years = n_years, M = M,
+                                        R0 = R0, steep = steep, SSB0 = SSB0,
+                                        growth_params = growth_params, ages = ages,
+                                        temp_series = temp_series, F_pattern = F_pattern,
+                                        temp_effect_on_K = TRUE, deltaK_perC = deltaK_perC) 
+)
+
+# Iterates (map) over each element of the scenarios list
+pop_all_df <- map_dfr(
+  scenarios,       # Iterate (map) over scenarios list
+  ~ .x$pop,        # Extract the $pop data frame from each (~ .x$pop), and combine them into one large tibble
+  .id = "scenario" # Add a new column scenario with the list names
+)
+
+pop_all <- pop_all_df
+```
+
+### Make some plots!
+
+```{r}
+#| message: false
+#| warning: false
+
+# Plot!
+pop_all <- pop_all |> 
+  left_join(temp_series, by = "year") |> 
+  mutate(
+    Fishing = ifelse(str_detect(scenario, "^Fished"), "Fished", "Unfished"),
+    Warming = ifelse(str_detect(scenario, "_Warming$"), "Yes", "No")
+  )
+
+# Sample points weighted by N
+k_last_year <- pop_all |>
+  filter(age <= 9, age > 1, year == max(year)) |>
+  summarise(
+    mean = sum(K * N) / sum(N),
+    totalN = sum(N),
+    .by = c(Fishing, Warming, age)
+  ) |>
+  mutate(rel_abund = totalN / sum(totalN),
+         .by = c(Fishing, Warming))
+
+# Compute expected K at last year given true effect of warming
+expected_K <- growth_params |>
+  select(platoon, K) |>
+  summarise(K_base = mean(K)) |>
+  mutate(K_end_warming = K_base + deltaK_perC * 2)  # 2=total_warming in C
+
+vlines_K <- tibble(
+  K_line = c(expected_K$K_base, expected_K$K_end_warming),
+  Warming = c("No", "Yes")
+)
+
+ggplot(k_last_year, aes(age, mean, color = Warming, size = rel_abund)) +
+  geom_hline(data = vlines_K, aes(yintercept = K_line, color = Warming),
+             linetype = 2, alpha = 0.8) +
+  geom_point(position = position_dodge(width = 0.2), alpha = 0.7) +
+  geom_smooth(method = "gam", formula = y ~ s(x, k = 3), se = FALSE,
+              inherit.aes = FALSE, linewidth = 0.5,
+              aes(age, mean, color = Warming)) +
+  scale_color_brewer(palette = "Set1", direction = -1) +
+  scale_size_continuous(range = c(1, 7), name = "Relative\nabundance") +
+  labs(x = "Age", y = "Growth coefficient (K)", color = "Warming") +
+  facet_wrap(~Fishing)
+
+ggsave(paste0(home, "/figures/bias_age.pdf"), width = 17, height = 11, units = "cm")
+```
+
+There's a small bias in the top left. If I remove noise around the temperature effect this disappears.
+
+```{r}
+#| message: false
+#| fig-height: 3
+
+# How well do we estimate the effect of temp on K?
+slopes <- pop_all |>
+  filter(age <= 9, age > 1) |>
+  group_by(Fishing, Warming, age) |>
+  slice_sample(n = 5000, weight_by = N, replace = TRUE) |>
+  ungroup() |> 
+  summarise(mean = mean(K), ymin = quantile(K, 0.25), ymax = quantile(K, 0.75),
+            .by = c(Fishing, Warming, age, temp, year)) |> 
+  mutate(scenario = paste(Fishing, Warming, sep = "_")) %>% 
+  split(.$scenario) %>% 
+  map_dfr(~ {
+    fit <- lm(mean ~ temp, data = .)
+    tidy(fit) %>% filter(term == "temp")
+  }, .id = "scenario") |>
+  separate(scenario, into = c("Fishing", "Warming"), sep = "_", remove = FALSE) |> 
+  mutate(
+    Warming = if_else(Warming == "Yes", "Warming", "No Warming"),
+    scen = paste(Fishing, "+", Warming, sep = "")
+  )
+
+vlines <- tibble(
+  x = c(0, deltaK_perC),
+  Warming = c("No Warming", "Warming")
+)
+
+ggplot(slopes, aes(estimate, scen, color = Warming)) +
+  geom_vline(data = vlines, aes(xintercept = x, color = Warming),
+             linetype = 2, alpha = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(xmin = estimate - std.error*1.96,
+                    xmax = estimate + std.error*1.96), width = 0) + 
+  scale_color_brewer(palette = "Set1", direction = -1) +
+  guides(color = "none") +
+  labs(x = "Estimated temperature effect on K") + 
+  theme(axis.title.y = element_blank())
+
+ggsave(paste0(home, "/figures/bias.pdf"), width = 10, height = 7, units = "cm")
+```
+
+### Conclusion
+
+* In the un-fished scenarios, no warming scenario, we can correctly retrieve the true K (this is really just a sanity test). In the unfished + warming scenario, we sort of can, but there's a small bias (that disappears. when I reduce temperature noise).
+
+* As for the *temperature effect on K*, we correctly retrieve the slope in the unfished scenarios. When we have fishing + no warming, we erroneously estimate a negative temperature effect on K (that's the Rosa Lee effect), and in the fishing + warming scenario, we underestimate the true temperature effect on K.
+
+### To do
+
+Some ideas for extensions are:
+
+* More simulations (more true slopes, more rates of warming)
+
+* Other life histories? I had cod in mind here (slow growing, long lived [with some modifications]), but we could consider a flatfish (fast growth, long life), and a forage fish (fast growth, short life), following `ss3sim` categories.
