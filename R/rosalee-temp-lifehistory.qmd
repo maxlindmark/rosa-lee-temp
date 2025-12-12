@@ -1,0 +1,1460 @@
+---
+title: "Bias in temperature-estimates on growth due to Rosa Lee effect - varying life histories"
+author: "Max Lindmark"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    toc: true
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 80%
+editor: source
+execute: 
+  echo: true
+  eval: true
+  cache: false
+---
+
+In this script, we extend the basic model (rosa-lee-basic-example.qmd) and the temperature-dependent model (rosa-lee-temp-example.qmd) to include different fish life histories, removed +group, modified the functions to run the code to make sensitivity analysis easier, made maturity size not age-based, and finally changed life history parameters to match [Johnson et al (2014)](https://academic.oup.com/icesjms/article/72/1/137/823490?login=false) and [Ono et al (2014)](https://academic.oup.com/icesjms/article/72/1/31/816216?login=false)
+
+```{r}
+#| message: false
+#| warning: false
+
+library(viridis)
+library(ggdist)
+library(patchwork)
+library(viridis)
+library(tidyverse)
+library(ggsidekick)
+library(purrr)
+library(broom)
+library(extraDistr)
+library(tictoc)
+library(RColorBrewer)
+theme_set(theme_sleek())
+
+# Set path
+home <- here::here()
+```
+
+### Define some helper functions
+
+```{r}
+calc_length_at_age <- function(age, Linf, K, t0) {
+  Linf * (1 - exp(-K * (age - t0)))
+}
+
+# Length-weight relationship
+calc_weight_from_length <- function(length, a_lw, b_lw) {
+  a_lw * length^b_lw
+}
+
+# Create fishing mortality pattern
+make_F_pattern <- function(n_years, F_longterm = 0.4,
+                           start_year = 5, ramp_length = 10) {
+  tibble(year = 1:n_years) |>
+    mutate(
+      F_mult = F_longterm / (1 + exp(-(year - start_year - ramp_length / 2) * 4 / ramp_length))
+    )
+}
+
+# FIXME do I plot this in SI?
+make_F_pattern(n_year = 100) |>
+  ggplot(aes(year, F_mult)) +
+  geom_line()
+
+# No ramp up
+# make_F_pattern <- function(n_years, F_longterm = 0.4) {
+#   tibble(year = 1:n_years, F_mult = F_longterm)
+# }
+
+# Function to create temperature time series, given n_years for simulation and total warming
+make_temp_series <- function(n_years, total_warming = 2, noise_sd = 0.25,
+                             seed = NULL, constant_temp = FALSE) {
+  if (!is.null(seed)) set.seed(seed)
+
+  if (constant_temp) {
+    # Constant temperature at final warming level
+    tibble(year = 1:n_years, temp = total_warming)
+  } else {
+    # Linear trend with noise
+    trend <- seq(0, total_warming, length.out = n_years)
+    eps <- rnorm(n_years, 0, noise_sd)
+    tibble(year = 1:n_years, temp = trend + eps)
+  }
+}
+
+# Beverton-Holt stock-recruitment (SS3 parameterization)
+beverton_holt <- function(SSB, R0, steep, SSB0) {
+  4 * steep * R0 * SSB / (SSB0 * (1 - steep) + SSB * (5 * steep - 1))
+}
+```
+
+### Define paramters by life history type
+These are inspired by `ss3sim ` types, see [Johnson et al (2014)](https://academic.oup.com/icesjms/article/72/1/137/823490?login=false) and [Ono et al (2014)](https://academic.oup.com/icesjms/article/72/1/31/816216?login=false).
+
+```{r}
+# FIXME: CHECK THESE PARAMETERS
+life_history_table <- tibble(
+  species = c("cod", "flatfish", "sardine"),
+  mean_K = c(0.20, 0.35, 0.40),
+  Linf = c(132, 47.4, 25),
+  t0 = c(-0.2, -0.2, -0.2),
+  M = c(0.20, 0.20, 0.40),
+  n_ages = c(25, 25, 15),
+  a_lw = c(6.8e-6, 1.0e-5, 1.7e-5) * 1000,
+  b_lw = c(3.1, 3.0, 2.9),
+  L50_mat = c(38.2, 28.9, 15.9),
+  mat_slope = c(10.6, 7.0, 3.3),
+  steep = c(0.65, 0.76, 0.59),
+  L50_sel = c(38.2, 28.9, 15.9),
+  sel_slope = c(10.6, 7.0, 3.3)
+) #|>
+# Pauly 1979 version ...
+# mutate(t0 = -exp(-0.3922 - 0.2752 * log(Linf) - 1.038 * log(K)))
+
+# Function to grab LH parameters for a given species
+get_lh <- function(species) {
+  life_history_table |> filter(species == !!species)
+}
+
+# For how long to run the population dynamics model
+n_years <- 100
+```
+
+### Plot life history parameters and selectivity, and temperature
+
+Before running the simulation, let's look at how these "species" differ in terms of growth, maturation and selectivity.
+
+```{r}
+# Create a function to generate all life history curves for plotting
+plot_life_history <- function(n_platoons_show = 5, K_sd = 0.1) {
+  # Get all species
+  species_list <- c("cod", "flatfish", "sardine")
+
+  # Create data for mean life history curves
+  # Iterate over each species name and rowbind these calculations
+  # This to get the mean variables
+  lh_curves_mean <- map_dfr(species_list, function(sp) {
+    lh <- get_lh(sp)
+    ages <- seq(0, lh$n_ages - 1, length.out = 100)
+
+    tibble(
+      species = sp,
+      age = ages,
+      length = calc_length_at_age(age, lh$Linf, lh$mean_K, lh$t0),
+      weight = calc_weight_from_length(length, lh$a_lw, lh$b_lw),
+      maturity = plogis((length - lh$L50_mat) / lh$mat_slope),
+      selectivity = plogis((length - lh$L50_sel) / lh$sel_slope),
+      type = "mean"
+    )
+  })
+
+  # Create data for platoon variation
+  # This is just to draw a few example lines besides the mean (for length-at-age)
+  lh_curves_platoons <- map_dfr(species_list, function(sp) {
+    lh <- get_lh(sp)
+    ages <- seq(0, lh$n_ages - 1, length.out = 100)
+
+    # Draw K values for platoons
+    set.seed(79)
+    K_vals <- rnorm(n_platoons_show, mean = lh$mean_K, sd = K_sd)
+    K_vals <- pmax(K_vals, 0.01)
+
+    # Create curves for each platoon
+    map_dfr(1:n_platoons_show, function(p) {
+      length <- calc_length_at_age(ages, lh$Linf, K_vals[p], lh$t0)
+      weight <- calc_weight_from_length(length, lh$a_lw, lh$b_lw)
+
+      tibble(
+        species = sp,
+        age = ages,
+        platoon = p,
+        length = length,
+        weight = weight,
+        maturity = plogis((length - lh$L50_mat) / lh$mat_slope),
+        selectivity = plogis((length - lh$L50_sel) / lh$sel_slope),
+        type = "platoon"
+      )
+    })
+  })
+
+  # Combine
+  lh_curves <- bind_rows(lh_curves_platoons, lh_curves_mean) |>
+    mutate(group_id = paste(species, coalesce(as.character(platoon), "mean"), type))
+
+  # Length-at-age (VBGE)
+  p1 <- ggplot(lh_curves, aes(age, length, color = species, group = group_id)) +
+    geom_line(data = filter(lh_curves, type == "platoon"), alpha = 0.3) +
+    geom_line(data = filter(lh_curves, type == "mean"), linewidth = 1.2) +
+    annotate("text",
+      x = -Inf, y = Inf, label = "a", color = "grey30",
+      hjust = -0.5, vjust = 1.5, size = 4
+    ) +
+    labs(
+      x = "Age (years)",
+      y = "Length (cm)"
+    ) +
+    guides(color = "none")
+
+  # Stock-recruit relationship
+  stock_rec <- map_dfr(species_list, function(sp) {
+    lh <- get_lh(sp)
+
+    R0 <- 1000
+    ages <- 0:(lh$n_ages - 1)
+
+    # Size-at-age (needed for SSB0)
+    size_at_age <- tibble(age = ages) |>
+      mutate(
+        length = calc_length_at_age(age, lh$Linf, lh$mean_K, lh$t0),
+        weight = calc_weight_from_length(length, lh$a_lw, lh$b_lw),
+        maturity = plogis((length - lh$L50_mat) / lh$mat_slope)
+      )
+
+    # SSB0
+    SSB0 <- size_at_age |>
+      mutate(N = R0 * exp(-lh$M * age)) |>
+      summarise(SSB0 = sum(N * weight * maturity)) |>
+      pull(SSB0)
+
+    # SSB sequence to plot over
+    SSB_seq <- seq(0, SSB0 * 1.2, length.out = 100)
+
+    tibble(
+      species = sp,
+      SSB = SSB_seq,
+      Recruits = beverton_holt(SSB_seq, R0, lh$steep, SSB0)
+    )
+  })
+
+  # Plot rec ~ ssb
+  p2 <- stock_rec |>
+    filter(SSB > 0) |>
+    mutate(SSB_ct = SSB / max(SSB), .by = species) |>
+    ggplot(aes(SSB_ct, Recruits, color = species)) +
+    geom_line(linewidth = 1.2) +
+    annotate(
+      "text",
+      x = -Inf, y = Inf, label = "b", color = "grey30",
+      hjust = -0.5, vjust = 1.5, size = 4
+    ) +
+    labs(
+      x = "Spawning stock biomass (relative to max.)",
+      y = "Recruitment (thousands)"
+    ) +
+    guides(color = "none")
+
+  # Maturity ogive (by length)
+  p3 <- ggplot(lh_curves, aes(length, maturity, color = species, group = group_id)) +
+    # geom_line(data = filter(lh_curves, type == "platoon"), alpha = 0.3) +
+    geom_line(data = filter(lh_curves, type == "mean"), linewidth = 1.2) +
+    # sqrt looks nicer but messes up position of annotation..
+    # scale_x_continuous(trans = "sqrt") +
+    annotate("text",
+      x = -Inf, y = Inf, label = "c", color = "grey30",
+      hjust = -0.5, vjust = 1.5, size = 4
+    ) +
+    labs(
+      x = "Length (cm)",
+      y = "Proportion mature"
+    ) +
+    guides(color = "none")
+
+  # Selectivity (by length)
+  p4 <- ggplot(lh_curves, aes(length, selectivity, color = str_to_sentence(species), group = group_id)) +
+    # geom_line(data = filter(lh_curves, type == "platoon"), alpha = 0.3) +
+    geom_line(data = filter(lh_curves, type == "mean"), linewidth = 1.2) +
+    annotate("text",
+      x = -Inf, y = Inf, label = "d", color = "grey30",
+      hjust = -0.5, vjust = 1.5, size = 4
+    ) +
+    # scale_x_continuous(trans = "sqrt") +
+    labs(
+      x = "Length (cm)",
+      y = "Selectivity"
+    ) +
+    theme(
+      legend.position.inside = c(0.8, 0.2),
+      legend.title = element_blank()
+    ) +
+    guides(color = guide_legend(position = "inside"))
+
+  ((p1 + p2) / (p3 + p4)) &
+    scale_color_brewer(palette = "Accent")
+}
+
+# Run the function
+plot_life_history(n_platoons_show = 30, K_sd = 0.1)
+
+# Save it
+ggsave(paste0(home, "/figures/life_history_parameters.pdf"),
+  width = 18, height = 14, units = "cm"
+)
+```
+
+Plot temperature
+
+```{r}
+# Generate a bunch of temperature-series and plot as examples
+# TODO: maybe there should be an AR1 processes but I don't think that's necessary for this purpose...
+# but it would be realistic
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+
+# Define seeds and total_warming values
+params <- tibble(
+  seed = c(43:45),
+  total_warming = c(
+    rep(2, 3)
+    # , rep(0, 3)
+  ) # first 4 have warming, last 4 are constant
+)
+
+# Generate temp series
+temp_df <- params |>
+  mutate(temp_data = map2(seed, total_warming, ~ make_temp_series(
+    n_years = n_years,
+    seed = .x,
+    total_warming = .y
+  ))) |>
+  unnest(temp_data)
+
+# Add warming category for plotting
+temp_df |>
+  # mutate(warming = ifelse(seed <= 45, "Yes", "No")) |>
+  # ggplot(aes(year, temp, group = as.factor(seed), color = warming)) +
+  ggplot(aes(year, temp, color = as.factor(seed))) +
+  geom_line(alpha = 0.85) +
+  scale_color_brewer(palette = "Dark2", direction = -1) +
+  guides(color = "none") +
+  labs(y = "Temperature anomaly relative to first year (°C)", x = "Year")
+
+ggsave(paste0(home, "/figures/temp_anomaly.pdf"), width = 10, height = 9, units = "cm")
+```
+
+### Population dynamics function
+
+```{r}
+# Population dynamics simulation engine
+pop_dynamics_warming <- function(init_pop, n_years, M, R0, steep, SSB0,
+                                 growth_params, ages,
+                                 temp_series = NULL,
+                                 temp_effect_on_K = FALSE,
+                                 deltaK_perC = 0.025,
+                                 L50_mat, mat_slope,
+                                 L50_sel, sel_slope,
+                                 a_lw, b_lw,
+                                 F_longterm = 0.4) {
+  # Create F_pattern based on F_longterm
+  F_pattern <- make_F_pattern(n_years, F_longterm)
+
+  # Create temp_series if not provided
+  if (is.null(temp_series)) {
+    temp_series <- make_temp_series(n_years, total_warming = 0, seed = 99)
+  }
+  stopifnot(nrow(temp_series) >= n_years)
+
+  # Initialize population
+  pop <- init_pop |> dplyr::select(year, age, platoon, N, K)
+
+  # Year loop
+  for (y in 2:n_years) {
+    prev <- pop |> filter(year == y - 1)
+
+    # Aggregate by age x platoon
+    prev_unique <- prev |>
+      summarise(N = sum(N), .by = c(age, platoon))
+
+    # Temperature effect on growth
+    base_K_df <- growth_params |> dplyr::select(platoon, Linf, K, t0)
+    temp_anom <- temp_series |>
+      filter(year == y) |>
+      pull(temp)
+
+    if (temp_effect_on_K) {
+      base_K_df <- base_K_df |>
+        mutate(K_adj = K + deltaK_perC * temp_anom)
+    } else {
+      base_K_df <- base_K_df |>
+        mutate(K_adj = K)
+    }
+
+    # Prevent negative K values
+    base_K_df <- base_K_df |>
+      mutate(K_adj = pmax(K_adj, 1e-6))
+
+    # Calculate size-at-age for this year
+    size_at_age_year <- base_K_df |>
+      crossing(age = ages) |>
+      mutate(
+        length = calc_length_at_age(age, Linf, K_adj, t0),
+        length = ifelse(is.nan(length) | is.infinite(length), 0, length),
+        weight = calc_weight_from_length(length, a_lw, b_lw)
+      ) |>
+      dplyr::select(platoon, age, Linf, K = K_adj, t0, length, weight)
+
+    # Size-based selectivity and maturity
+    selectivity_year <- size_at_age_year |>
+      mutate(selectivity = plogis((length - L50_sel) / sel_slope)) |>
+      dplyr::select(platoon, age, selectivity)
+
+    maturity_year <- size_at_age_year |>
+      mutate(maturity = plogis((length - L50_mat) / mat_slope)) |>
+      dplyr::select(platoon, age, maturity)
+
+    # Combine all demographic info
+    prev_unique2 <- prev_unique |>
+      left_join(size_at_age_year, by = c("age", "platoon")) |>
+      left_join(maturity_year, by = c("age", "platoon")) |>
+      left_join(selectivity_year, by = c("age", "platoon")) |>
+      mutate(selectivity = ifelse(is.na(selectivity), 0, selectivity))
+
+    # Stock-recruitment
+    SSB <- sum(prev_unique2$N * prev_unique2$weight * prev_unique2$maturity)
+    # SSB0 is calculated from the init_pop!
+    recruits <- beverton_holt(SSB, R0, steep, SSB0)
+
+    # Apply mortality
+    F_y <- F_pattern |>
+      filter(year == y) |>
+      pull(F_mult)
+
+    # "Grow" fish
+    aged <- prev_unique2 |>
+      mutate(
+        F = F_y * selectivity,
+        Z = M + F,
+        N_aged = N * exp(-Z),
+        age = age + 1
+      )
+
+    # Update population
+    new_year <- aged |>
+      filter(age < max(ages)) |>
+      summarise(N = sum(N_aged), .by = c(age, platoon)) |>
+      mutate(year = y)
+
+    # Add recruits
+    # TODO: note how the each recruitment has the original platoon distribution (prop) (that's why we use growth_params!)
+    # In theory we could add heritable growth by letting the recruitment get the same K as the platoon
+    recruits_df <- growth_params |>
+      dplyr::select(platoon, prop) |>
+      mutate(year = y, age = 0, N = recruits * prop)
+
+    new_year <- bind_rows(new_year, recruits_df)
+
+    # Add K_adj back to population tracker
+    new_year <- new_year |>
+      left_join(base_K_df |> dplyr::select(platoon, K_adj), by = "platoon") |>
+      rename(K = K_adj)
+
+    pop <- bind_rows(pop, new_year) |>
+      dplyr::select(year, age, platoon, N, K)
+  }
+
+  list(pop = pop, temp_series = temp_series, F_pattern = F_pattern)
+}
+```
+
+### Function to run `pop_dynamics_warming` for a given life history
+
+This functions uses species-specific parameters to initialize and parameterize pop_dynamics_warming
+
+```{r}
+run_species_model <- function(species = "cod",
+                              R0 = 1000,
+                              n_platoons = 250,
+                              deltaK_perC = 0.025,
+                              temp_series,
+                              temp_effect_on_K = FALSE,
+                              F_longterm = 0.4,
+                              K_sd = 0.1) {
+  # Get life history parameters
+  lh <- get_lh(species)
+  ages <- 0:(lh$n_ages - 1)
+
+  # Setup platoons with growth variation
+  K_vals <- rtnorm(n_platoons,
+    a = 0.06,
+    b = Inf,
+    mean = lh$mean_K,
+    sd = K_sd
+  )
+
+  growth_params <- tibble(
+    platoon = 1:n_platoons,
+    Linf = lh$Linf,
+    K = K_vals,
+    t0 = lh$t0,
+    prop = 1 / n_platoons
+  )
+
+  # Calculate initial size-at-age across platoons
+  size_at_age <- growth_params |>
+    crossing(age = ages) |>
+    mutate(
+      length = calc_length_at_age(age, Linf, K, t0),
+      weight = calc_weight_from_length(length, lh$a_lw, lh$b_lw)
+    )
+
+  # Size-based biological parameters
+  maturity <- size_at_age |>
+    mutate(maturity = plogis((length - lh$L50_mat) / lh$mat_slope)) |>
+    dplyr::select(platoon, age, maturity)
+
+  selectivity <- size_at_age |>
+    mutate(selectivity = plogis((length - lh$L50_sel) / lh$sel_slope)) |>
+    dplyr::select(platoon, age, selectivity)
+
+  # Initialize unfished equilibrium population
+  init_pop <- crossing(year = 1, age = ages, platoon = 1:n_platoons) |>
+    left_join(growth_params |> dplyr::select(platoon, prop), by = "platoon") |>
+    mutate(N = R0 * prop * exp(-lh$M * age)) |>
+    left_join(size_at_age, by = c("platoon", "age")) |>
+    left_join(maturity, by = c("platoon", "age")) |>
+    left_join(selectivity, by = c("platoon", "age"))
+
+  # Calculate unfished SSB (reference point)
+  SSB0 <- init_pop |>
+    mutate(SSB_contrib = N * weight * maturity) |>
+    summarise(SSB0 = sum(SSB_contrib)) |>
+    pull(SSB0)
+
+  # Run population dynamics
+  pop_dynamics_warming(
+    init_pop         = init_pop,
+    n_years          = n_years,
+    M                = lh$M,
+    R0               = R0,
+    steep            = lh$steep,
+    SSB0             = SSB0,
+    growth_params    = growth_params,
+    ages             = ages,
+    temp_series      = temp_series,
+    temp_effect_on_K = temp_effect_on_K,
+    deltaK_perC      = deltaK_perC,
+    L50_sel          = lh$L50_sel,
+    sel_slope        = lh$sel_slope,
+    a_lw             = lh$a_lw,
+    b_lw             = lh$b_lw,
+    L50_mat          = lh$L50_mat,
+    mat_slope        = lh$mat_slope,
+    F_longterm       = F_longterm
+  )
+}
+```
+
+### Function to run all scenarios (fishing*warming)
+
+```{r}
+# Function to run all four scenarios for a species
+run_all_scenarios <- function(species = "cod",
+                              n_years = 100,
+                              R0 = 1000,
+                              deltaK_perC = 0.025,
+                              F_longterm = 0.4,
+                              total_warming = 2,
+                              seed = 99,
+                              ...) {
+  # Create temperature scenarios
+  temp_warming <- make_temp_series(n_years, total_warming = total_warming, seed = seed)
+  temp_zero <- make_temp_series(n_years, total_warming = 0)
+
+  # Run all four combinations
+  scenarios <- list(
+    UnFished_NoWarming = run_species_model(
+      species = species,
+      R0 = R0,
+      temp_series = temp_zero,
+      temp_effect_on_K = FALSE,
+      F_longterm = 0,
+      deltaK_perC = deltaK_perC,
+      ...
+    ),
+    Fished_NoWarming = run_species_model(
+      species = species,
+      R0 = R0,
+      temp_series = temp_zero,
+      temp_effect_on_K = FALSE,
+      F_longterm = F_longterm,
+      deltaK_perC = deltaK_perC,
+      ...
+    ),
+    # This is to remove the rosa lee effect (no growth morphs)
+    Fished_NoWarming_ctrl = run_species_model(
+      species = species,
+      R0 = R0,
+      temp_series = temp_zero,
+      temp_effect_on_K = FALSE,
+      F_longterm = F_longterm,
+      deltaK_perC = deltaK_perC,
+      K_sd = 1e-10, # 0 breaks the code
+      ...
+    ),
+    # This is to remove the rosa lee effect, but have warming
+    Fished_Warming_ctrl1 = run_species_model(
+      species = species,
+      R0 = R0,
+      temp_series = temp_warming,
+      temp_effect_on_K = TRUE,
+      F_longterm = F_longterm,
+      deltaK_perC = deltaK_perC,
+      K_sd = 1e-10, # 0 breaks the code
+      ...
+    ),
+    UnFished_Warming = run_species_model(
+      species = species,
+      R0 = R0,
+      temp_series = temp_warming,
+      temp_effect_on_K = TRUE,
+      F_longterm = 0,
+      deltaK_perC = deltaK_perC,
+      ...
+    ),
+    UnFished_Warming_ctrl = run_species_model(
+      species = species,
+      R0 = R0,
+      temp_series = temp_warming,
+      temp_effect_on_K = FALSE,
+      F_longterm = 0,
+      deltaK_perC = deltaK_perC,
+      ...
+    ),
+    Fished_Warming = run_species_model(
+      species = species,
+      R0 = R0,
+      temp_series = temp_warming,
+      temp_effect_on_K = TRUE,
+      F_longterm = F_longterm,
+      deltaK_perC = deltaK_perC,
+      ...
+    ),
+    Fished_Warming_ctrl2 = run_species_model(
+      species = species,
+      R0 = R0,
+      temp_series = temp_warming,
+      temp_effect_on_K = FALSE,
+      F_longterm = F_longterm,
+      deltaK_perC = deltaK_perC,
+      ...
+    )
+  )
+
+  # Combine all populations into one dataframe
+  pop_all <- map_dfr(
+    scenarios,
+    ~ .x$pop,
+    .id = "scenario"
+  )
+
+  # Add temperature data directly to pop_all
+  # First, identify which scenarios have warming
+  pop_all <- pop_all |>
+    mutate(
+      Warming = ifelse(str_detect(scenario, "NoWarming"), "No", "Yes"),
+      Fishing = ifelse(str_detect(scenario, "Unfished"), "No", "Yes")
+    )
+
+  # Join appropriate temperature series based on scenario
+  temp_combined <- bind_rows(
+    temp_warming |> mutate(Warming = "Yes"),
+    temp_zero |> mutate(Warming = "No")
+  )
+
+  pop_all <- pop_all |>
+    left_join(temp_combined, by = c("year", "Warming"))
+
+  # Return combined data and individual scenario results
+  list(
+    pop_all = pop_all,
+    scenarios = scenarios
+  )
+}
+```
+
+### Run all scenarios
+Run all scenarios for different seeds (because we get random spurious correlations in the scenario with fishing and without temperature effects)
+
+```{r}
+# Define the seeds
+seed_list <- 1:30
+
+species_list <- c("cod", "flatfish", "sardine")
+
+pop_all_species_seeds <- map_dfr(species_list, function(species) {
+  imap_dfr(seed_list, function(seed, seed_counter) {
+    cat("Running seed", seed_counter, "for species", species, "\n")
+
+    run_all_scenarios(
+      species = species, seed = seed,
+      deltaK_perC = 0.025
+    )$pop_all %>%
+      mutate(species = species, seed = seed, seed_iteration = seed_counter)
+  })
+})
+```
+
+```{r}
+# Calculate mean K by age, year, and temp
+# TODO: should I do sampling by age? not sure. This is in proportion to N
+
+slopes <- pop_all_species_seeds |>
+  filter(between(age, 4, 10)) |>
+  summarise(
+    K = sum(K * N) / sum(N),
+    temp = mean(temp),
+    .by = c(species, Fishing, Warming, year, scenario, seed)
+  ) |>
+  mutate(scenario = ifelse(str_detect(scenario, "ctrl"),
+    scenario,
+    paste0(scenario, "_exp")
+  )) |>
+  mutate(scenario = paste(scenario, species, seed, sep = "_")) %>%
+  split(.$scenario) |>
+  map_dfr(~ {
+    fit <- lm(K ~ temp, data = .)
+    # fit <- sdmTMB::sdmTMB(K ~ temp, data = ., spatial = "off", family = Gamma(link = "log"))
+    tidy(fit) |> filter(term == "temp")
+    # fit <- glmmTMB(mean_K ~ mean_temp, family = t_family, data = plot_data)
+    # fixef(fit)$cond[2]
+  }, .id = "scenario") |>
+  separate(scenario, into = c("Fishing", "Warming", "type", "species", "seed"), sep = "_", remove = FALSE) |>
+  mutate(scenario2 = paste(Fishing, Warming, type, species, sep = "_")) |>
+  mutate(scenario3 = paste(Fishing, Warming, type, sep = "_")) |>
+  mutate(
+    Fishing = ifelse(Fishing == "UnFished", "No Fishing", "Fishing"),
+    Warming = ifelse(Warming == "NoWarming", "No Warming", Warming)
+  )
+
+write_csv(slopes, paste0(home, "/output/slopes_allscen_seed.csv"))
+```
+
+### Plot all scenarios
+
+```{r}
+slopes <- read_csv(paste0(home, "/output/slopes_allscen_seed.csv"))
+
+deltaK_perC <- 0.025
+
+# Main plot
+dw <- 0.6
+pd <- position_jitterdodge(jitter.width = 0.1, dodge.width = dw)
+
+vlines <- tibble(
+  x = c(0, deltaK_perC),
+  temp_dep = c("Temperature dependent K = FALSE", "Temperature dependent K = TRUE")
+)
+
+# For mean across scenarios
+summary_df <- slopes |>
+  filter(scenario3 %in% c(
+    "Fished_Warming_ctrl2", "Fished_Warming_exp",
+    "UnFished_Warming_exp", "UnFished_Warming_ctrl"
+  )) |>
+  mutate(temp_dep = ifelse(scenario3 %in% c("Fished_Warming_ctrl2", "UnFished_Warming_ctrl"),
+    "Temperature dependent K = FALSE", "Temperature dependent K = TRUE"
+  )) |>
+  summarise(
+    mean_est = mean(estimate, na.rm = TRUE),
+    sd_est = sd(estimate, na.rm = TRUE),
+    .by = c(Warming, Fishing, species, scenario3, temp_dep)
+  )
+
+p1 <- slopes |>
+  filter(scenario3 %in% c(
+    "Fished_Warming_ctrl2", "Fished_Warming_exp",
+    "UnFished_Warming_exp", "UnFished_Warming_ctrl"
+  )) |>
+  mutate(temp_dep = ifelse(scenario3 %in% c("Fished_Warming_ctrl2", "UnFished_Warming_ctrl"),
+    "Temperature dependent K = FALSE", "Temperature dependent K = TRUE"
+  )) |>
+  ggplot(aes(estimate, Fishing,
+    color = str_to_sentence(species),
+    fill = str_to_sentence(species)
+  )) +
+  facet_wrap(~temp_dep, scales = "free_x") +
+  geom_vline(
+    data = vlines,
+    aes(xintercept = x),
+    linetype = 2, alpha = 0.5
+  ) +
+  geom_point(
+    position = pd, alpha = 0.25 # ,
+    # shape = 21, size = 2,
+    # stroke = 0.5, color = "grey90"
+  ) +
+  geom_errorbar(
+    data = summary_df,
+    aes(
+      mean_est,
+      Fishing,
+      xmin = mean_est - sd_est,
+      xmax = mean_est + sd_est,
+      color = str_to_sentence(species)
+    ),
+    width = 0,
+    linewidth = 0.8,
+    position = position_dodge(width = dw)
+  ) +
+  geom_point(
+    data = summary_df,
+    aes(mean_est, Fishing, fill = str_to_sentence(species)),
+    size = 2,
+    shape = 21,
+    color = "gray30",
+    position = position_dodge(width = dw)
+  ) +
+  scale_color_brewer(palette = "Accent") +
+  scale_fill_brewer(palette = "Accent") +
+  guides(color = guide_legend(position = "inside", ncol = 3)) +
+  labs(x = "Estimated temperature effect on K") +
+  theme(
+    axis.title.y = element_blank(),
+    legend.title = element_blank(),
+    legend.position.inside = c(0.16, 0.9)
+  )
+
+egg::tag_facet(p1, fontface = 1, open = "", close = "", color = "grey30", size = 4)
+
+ggsave(paste0(home, "/figures/temperature_bias.pdf"),
+  width = 17, height = 9, units = "cm"
+)
+
+# How important is this bias?
+p1 <- life_history_table |> 
+  dplyr::select(species, mean_K, Linf, t0) |> 
+  mutate(k_true = mean_K + 0.025*2, 
+         k_bias = mean_K + 0.02*2) |> 
+  crossing(age = seq(2, 10, length.out = 50)) |> 
+  mutate(length_true = calc_length_at_age(age, Linf, k_true, t0),
+         length_bias = calc_length_at_age(age, Linf, k_bias, t0)) |> 
+  mutate(diff = length_bias - length_true) |> 
+  pivot_longer(cols = c("length_bias", "length_true")) |> 
+  mutate(name = ifelse(name == "length_bias", "Length with bias", "Length without bias")) |> 
+  ggplot(aes(age, value, color = str_to_sentence(species), linetype = name)) + 
+  geom_line() +
+  guides(color = "none") +
+  labs(x = "Age", y = "Length (cm)") +
+  scale_linetype_manual(values = c(2, 1)) + 
+  scale_color_brewer(palette = "Accent") +
+  theme(legend.position = "bottom",
+        legend.title = element_blank())
+
+p2 <- life_history_table |> 
+  dplyr::select(species, mean_K, Linf, t0) |> 
+  mutate(k_true = mean_K + 0.025*2, 
+         k_bias = mean_K + 0.02*2) |> 
+  crossing(age = seq(1, 10, length.out = 50)) |> 
+  mutate(length_true = calc_length_at_age(age, Linf, k_true, t0),
+         length_bias = calc_length_at_age(age, Linf, k_bias, t0)) |> 
+  mutate(diff = length_bias - length_true) |> 
+  ggplot(aes(age, diff, color = str_to_sentence(species))) + 
+  geom_hline(yintercept = 0, linetype = 2, alpha = 0.7) +
+  scale_color_brewer(palette = "Accent") +
+  geom_line() +
+  labs(x = "Age", y = "Underestimation in size after +2°C") +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "bottom"
+  )
+
+(p1 + p2) + plot_layout(guides = "collect", axes = "collect") & theme(legend.position = "bottom")
+
+ggsave(paste0(home, "/figures/temperature_bias_ex.pdf"),
+  width = 19, height = 10, units = "cm"
+)
+
+# SI plot ?
+# Reference lines for true effect
+# deltaK_perC = 0.025
+#
+# vlines <- tibble(
+#   x = c(0, 0, deltaK_perC),
+#   Warming = c("NoWarming", "Warming", "Warming")
+# )
+#
+# # This for the supplement (temporarily as a sanity check, don't spend time on polishing it!)
+# ggplot(slopes, aes(estimate, scenario2)) +
+#   geom_vline(
+#     data = vlines,
+#     aes(xintercept = x, color = Warming),
+#     linetype = 2, alpha = 0.8
+#   ) +
+#   geom_point(size = 2, position = position_dodge(width = 0.3), alpha = 0.4) +
+#   scale_color_brewer(palette = "Set1", direction = -1) +
+#   guides(color = "none", shape = guide_legend(position = "inside")) +
+#   facet_wrap(~Warming, scales = "free", ncol = 2) +
+#   # facet_wrap(~, ncol = 2) +
+#   labs(x = "Estimated temperature effect on K") +
+#   theme(
+#     axis.title.y = element_blank(),
+#     legend.title = element_blank(),
+#     legend.position.inside = c(0.56, 0.9)
+#   )
+# The wide CIs on the Fished + No Warming is just because temperature varies randomly.
+# We also see the ctrl warming (no temp effect on K) estimates 0 effects
+```
+
+No some more basic plots for a given seed
+
+```{r}
+#| message: false
+#| warning: false
+
+# Basic population dynamics plot to test all looks OK
+
+pop_all_species_seeds |>
+  filter(seed == max(seed)) |>
+  filter(age <= 8) |>
+  summarise(n = sum(N), .by = c(year, age, scenario, species)) |>
+  ggplot(aes(year, n, fill = as.factor(age))) +
+  scale_fill_viridis(discrete = TRUE) +
+  facet_grid(scenario ~ str_to_sentence(species)) +
+  scale_y_continuous(trans = "sqrt") +
+  labs(fill = "age") +
+  coord_cartesian(expand = 0) +
+  geom_area(stat = "identity")
+
+ggsave(paste0(home, "/figures/n_over_time.pdf"),
+  width = 30, height = 25, units = "cm"
+)
+```
+
+Plot how K and growth changes in the population (Rosa Lee effect!)
+
+```{r}
+plot_rosa_lee_faceted <- function(pop_all_species) {
+  species_list <- c("cod", "flatfish", "sardine")
+
+  # Process species
+  all_data <- map(species_list, function(species_name) {
+    lh <- get_lh(species_name)
+
+    comparison <- pop_all_species |>
+      filter(
+        species == species_name,
+        year >= n_years - 10,
+        scenario %in% c("Fished_NoWarming", "Unfished_NoWarming")
+      ) |>
+      select(scenario, age, platoon, N, K, Fishing, Warming)
+
+    mean_K <- lh |> pull(mean_K)
+
+    # Calculate weighted mean and SD for K by age
+    k_summary <- comparison |>
+      filter(
+        scenario == "Fished_NoWarming",
+        age <= 10
+      ) |>
+      summarise(
+        K_weighted = sum(K * N) / sum(N),
+        # Weighted SD: sqrt(sum(w * (x - weighted_mean)^2) / sum(w))
+        K_sd = sqrt(sum(N * (K - sum(K * N) / sum(N))^2) / sum(N)),
+        .by = age
+      ) |>
+      mutate(
+        species = species_name,
+        mean_K = mean_K
+      )
+
+    get_mean_growth <- function(fishing) {
+      comparison |>
+        filter(Fishing == fishing, between(age, 4, 10)) |>
+        summarise(K_weighted = sum(K * N) / sum(N)) |>
+        crossing(age = 0:10) |>
+        mutate(
+          Fishing = fishing,
+          length = lh$Linf * (1 - exp(-K_weighted * (age - lh$t0)))
+        )
+    }
+
+    mean_growth <- bind_rows(
+      get_mean_growth("Fished"),
+      get_mean_growth("Unfished")
+    ) |>
+      mutate(species = species_name)
+
+    list(
+      k_distributions = k_summary,
+      mean_growth = mean_growth
+    )
+  })
+
+  k_dist_all <- map_dfr(all_data, "k_distributions")
+  mean_growth_all <- map_dfr(all_data, "mean_growth")
+
+  # Clean species names
+  k_dist_all$facet_species <- str_to_sentence(k_dist_all$species)
+  mean_growth_all$facet_species <- str_to_sentence(mean_growth_all$species)
+
+  # K by age
+  p1_data <- k_dist_all |>
+    mutate(
+      mean = K_weighted,
+      ymin = K_weighted - K_sd,
+      ymax = K_weighted + K_sd
+    ) |>
+    select(facet_species, age, mean, ymin, ymax)
+
+  # Facet labels
+  labs_p1 <- data.frame(
+    facet_species = c("Cod", "Flatfish", "Sardine"),
+    label = letters[1:3]
+  )
+
+  labs_p2 <- data.frame(
+    facet_species = c("Cod", "Flatfish", "Sardine"),
+    label = letters[4:6]
+  )
+
+  labs_p3 <- data.frame(
+    facet_species = c("Cod", "Flatfish", "Sardine"),
+    label = letters[7:9]
+  )
+
+  p1 <- ggplot() +
+    geom_hline(
+      data = distinct(k_dist_all, facet_species, mean_K),
+      aes(yintercept = mean_K),
+      linetype = 2, alpha = 0.7
+    ) +
+    geom_pointrange(
+      data = p1_data,
+      aes(as.factor(age), mean, ymin = ymin, ymax = ymax),
+      color = "grey20", alpha = 0.7
+    ) +
+    facet_wrap(~facet_species, scales = "free_y", ncol = 3) +
+    labs(x = "Age", y = expression("Growth coefficient (" * italic(K) * ")")) +
+    theme(
+      axis.title.x = element_blank(),
+      axis.text.x = element_blank()
+    ) +
+    geom_text(
+      data = labs_p1,
+      aes(label = label, x = -Inf, y = Inf),
+      hjust = -0.2, vjust = 1.3,
+      size = 4, color = "grey30",
+      inherit.aes = FALSE
+    )
+
+  # Growth trajectories
+  p2 <- ggplot(
+    mean_growth_all,
+    aes(age, length, color = Fishing)
+  ) +
+    geom_line() +
+    facet_wrap(~facet_species, scales = "free", ncol = 3) +
+    labs(x = "Age", y = "Length (cm)") +
+    scale_color_brewer(palette = "Set2") +
+    theme(
+      strip.text.x.top = element_blank(),
+      axis.title.x = element_blank(),
+      axis.text.x = element_blank(),
+      legend.title = element_blank(),
+      legend.position.inside = c(0.9, 0.2)
+    ) +
+    guides(color = guide_legend(position = "inside")) +
+    geom_text(
+      data = labs_p2,
+      aes(label = label, x = -Inf, y = Inf),
+      hjust = -0.5, vjust = 1.5,
+      size = 4, color = "grey30",
+      inherit.aes = FALSE
+    )
+
+  # Length-at-age difference
+  growth_diff <- mean_growth_all |>
+    select(facet_species, age, Fishing, length) |>
+    pivot_wider(names_from = Fishing, values_from = length) |>
+    mutate(diff_length = Fished - Unfished)
+
+  p3 <- ggplot(
+    growth_diff,
+    aes(age, diff_length)
+  ) +
+    geom_line(color = "grey20") +
+    geom_hline(yintercept = 0, linetype = 2, alpha = 0.7) +
+    facet_wrap(~facet_species, scales = "free", ncol = 3) +
+    labs(x = "Age", y = "Length difference\n(Fished-Unfished)") +
+    theme(strip.text.x.top = element_blank()) +
+    geom_text(
+      data = labs_p3,
+      aes(label = label, x = -Inf, y = Inf),
+      hjust = -0.5, vjust = 1.85,
+      size = 4, color = "grey30",
+      inherit.aes = FALSE
+    )
+
+  # Combine
+  (p1 / p2 / p3)
+}
+
+plot_rosa_lee_faceted(
+  pop_all_species_seeds |>
+    filter(seed == max(seed))
+)
+
+ggsave(paste0(home, "/figures/rosa_lee_all_species.pdf"),
+  width = 20, height = 16, units = "cm"
+)
+
+# Note the reason cod has higher K for earlier ages I think has to do with cod not really being at equilibrium, in contrast to the other species!
+```
+
+### Run specific scenarios and vary parameters
+
+```{r}
+# Function to run a subset of scenarios ...
+# TODO maybe the full function shouldnt hardcode scenarios .... could be input
+run_specific_scenarios <- function(species = "cod",
+                                   total_warming = 2,
+                                   F_longterm = 0.4,
+                                   seed = 99,
+                                   ...) {
+  temp_warming <- make_temp_series(n_years, total_warming = total_warming, seed = seed)
+
+  scenarios <- list(
+    # 1-2 are very much control scenarios... omitting them to save time
+    # 1. No Rosa Lee + No temperature dependence (baseline control)
+    # Fished_Warming_ctrl = run_species_model(
+    #   species = species,
+    #   R0 = 1000,
+    #   temp_series = temp_warming,
+    #   temp_effect_on_K = FALSE,
+    #   F_longterm = F_longterm,
+    #   K_sd = 1e-10
+    #   # Remove the ... here since there are no additional args to pass
+    # ),
+    # # 2. Rosa Lee + No Temperature dependence
+    # Fished_Warming_noT = run_species_model(
+    #   species = species,
+    #   R0 = 1000,
+    #   temp_series = temp_warming,
+    #   temp_effect_on_K = FALSE,
+    #   F_longterm = F_longterm
+    #   # Remove the trailing comma and ...
+    # ),
+    # 3. No Rosa Lee + Temperature dependence
+    Fished_Warming_noRL = run_species_model(
+      species = species,
+      R0 = 1000,
+      temp_series = temp_warming,
+      temp_effect_on_K = TRUE,
+      F_longterm = F_longterm,
+      K_sd = 1e-10
+    ),
+    # 4. Rosa Lee + Temperature dependence (full model)
+    Fished_Warming_full = run_species_model(
+      species = species,
+      R0 = 1000,
+      temp_series = temp_warming,
+      temp_effect_on_K = TRUE,
+      F_longterm = F_longterm
+    )
+  )
+
+  pop_all <- map_dfr(scenarios, ~ .x$pop, .id = "scenario")
+
+  pop_all <- pop_all |>
+    left_join(temp_warming, by = "year")
+
+  list(pop_all = pop_all, scenarios = scenarios)
+}
+
+# Define parameter ranges to run
+warming_values <- seq(0, 2, length.out = 10)
+F_values <- seq(0, 0.4, length.out = 10)
+seed_values <- 1:30
+
+# 1000 iterations takes 5.65 h
+param_grid <- expand_grid(
+  total_warming = warming_values,
+  F_longterm = F_values,
+  seed = seed_values
+)
+
+nrow(param_grid)
+
+species_list <- c("cod", "flatfish", "sardine")
+
+tic()
+results_all_params <- map_dfr(1:nrow(param_grid), function(i) {
+  warming <- param_grid$total_warming[i]
+  F_val <- param_grid$F_longterm[i]
+  seed_val <- param_grid$seed[i]
+
+  cat(
+    "Running simulation", i, "of", nrow(param_grid),
+    ": total_warming =", warming,
+    ", F_longterm =", F_val,
+    ", seed =", seed_val, "\n"
+  )
+
+  # Run for all species using the simpler function
+  pop_all_species <- map_dfr(
+    species_list,
+    ~ run_specific_scenarios(
+      species = .x,
+      total_warming = warming,
+      F_longterm = F_val,
+      seed = seed_val
+    )$pop_all |>
+      mutate(species = .x)
+  )
+
+  # Add the parameter values as columns; summarise to not create massive DF's
+  # Summarise across by seed, year, species, scenario.
+  pop_all_species |>
+    mutate(seed = seed_val) |>
+    filter(between(age, 4, 10)) |>
+    summarise(
+      K = sum(K * N) / sum(N),
+      temp = mean(temp),
+      .by = c(species, year, scenario, seed)
+    ) |>
+    mutate(
+      total_warming = warming,
+      F_longterm = F_val
+    )
+})
+toc()
+
+write_csv(results_all_params, paste0(home, "/output/results_all_params.csv"))
+
+# Calculate slopes of temp for each scenario
+slopes_by_par <- results_all_params |>
+  mutate(scenario = paste(species, F_longterm, total_warming, scenario, seed, sep = "-")) %>%
+  split(.$scenario) |>
+  map_dfr(~ {
+    fit <- lm(K ~ temp, data = .)
+    # fit <- sdmTMB::sdmTMB(K ~ temp, data = ., spatial = "off", family = Gamma(link = "log"))
+    tidy(fit) |> filter(term == "temp")
+    # fit <- glmmTMB(mean_K ~ mean_temp, family = t_family, data = plot_data)
+    # fixef(fit)$cond[2]
+  }, .id = "scenario") |>
+  separate(scenario,
+    into = c("species", "F_longterm", "total_warming", "scenario", "seed"),
+    sep = "-", remove = FALSE
+  )
+
+write_csv(slopes_by_par, paste0(home, "/output/slopes_by_par.csv"))
+```
+
+### Plot specific scenarios with parameter variation
+
+```{r}
+slopes_by_par <- read_csv(paste0(home, "/output/slopes_by_par.csv"))
+
+deltaK_perC <- 0.025
+
+# pal <- brewer.pal(11, "RdYlGn")
+pal <- brewer.pal(11, "RdYlBu")
+
+### test
+#t <- read_csv(paste0(home, "/output/results_all_params.csv"))
+# 
+# slopes_by_par |>
+#   filter(total_warming == min(total_warming) & scenario == "Fished_Warming_full") |>
+#   ggplot(aes(F_longterm, estimate, color = as.factor(seed))) +
+#   facet_wrap(~species) +
+#   geom_point()
+# 
+# t |>
+#   filter(total_warming == min(total_warming) & scenario == "Fished_Warming_full") |>
+#   ggplot(aes(F_longterm, K, color = species)) +
+#   geom_smooth(method = "lm") +
+#   geom_point()
+# 
+# t |>
+#   filter(total_warming == min(total_warming) & scenario == "Fished_Warming_full") |>
+#   ggplot(aes(year, K, color = species)) +
+#   facet_wrap(~F_longterm) +
+#   geom_point(alpha = 0.2) +
+#   geom_smooth(method = "lm")
+# 
+# t |>
+#   filter(total_warming == min(total_warming) & scenario == "Fished_Warming_full") |>
+#   ggplot(aes(year, K, color = as.factor(F_longterm))) +
+#   #facet_wrap(~F_longterm) +
+#   #geom_point(alpha = 0.2) +
+#   geom_smooth(method = "lm")
+# 
+# t |>
+#   filter(total_warming == min(total_warming) & scenario == "Fished_Warming_full") |>
+#   ggplot(aes(temp, K, color = as.factor(F_longterm))) +
+#   #facet_wrap(~F_longterm) +
+#   #geom_point(alpha = 0.2) +
+#   geom_smooth(method = "lm")
+# t |> 
+#   filter(total_warming == max(total_warming) & scenario == "Fished_Warming_full") |> 
+#   ggplot(aes(year, temp)) + 
+#   facet_wrap(~species) +
+#   geom_point(alpha = 0.2) + 
+#   geom_smooth(method = "lm")
+
+# Do I need to control for year? I think from these plots that the hard decline in high F leads to a steeper decline in K over time. 
+
+# Also I doubt this is significant... (!)
+###
+
+# egg::tag_facet over-plots with facet_grid i think, switching to manual labelling
+labels <- slopes_by_par |>
+  distinct(species, scenario) |>
+  filter(scenario %in% c("Fished_Warming_noRL", "Fished_Warming_full")) |>
+  mutate(facet = ifelse(scenario == "Fished_Warming_noRL", "No Rosa Lee", "With Rosa Lee")) |>
+  arrange(facet, species) |>
+  mutate(label = letters[1:6])
+
+# Maybe smooth this out with a model..
+slopes_by_par |>
+  summarise(
+    estimate = mean(estimate),
+    .by = c(species, F_longterm, total_warming, scenario)
+  ) |>
+  #mutate(bias = estimate - deltaK_perC) |>
+  filter(scenario %in% c("Fished_Warming_noRL", "Fished_Warming_full")) |>
+  mutate(facet = ifelse(scenario == "Fished_Warming_noRL", "No Rosa Lee", "With Rosa Lee")) |>
+  ggplot(aes(F_longterm, total_warming, fill = estimate)) +
+  geom_raster() +
+  labs(
+    x = "Long term F",
+    y = "Warming per century (°C)",
+    fill = "Estimate"
+  ) +
+  facet_grid(facet ~ str_to_sentence(species)) +
+  scale_fill_gradient2(low = pal[2], high = pal[length(pal) - 1], midpoint = deltaK_perC) +
+  geom_text(aes(label = label, x = -Inf, y = Inf),
+    hjust = -0.5, vjust = 1.5, size = 4, color = "grey30",
+    inherit.aes = FALSE,
+    data = labels
+  ) +
+  coord_cartesian(expand = 0)
+
+ggsave(paste0(home, "/figures/bias_temp_f.pdf"),
+  width = 18, height = 10, units = "cm"
+)
+```
+
+```{r}
+knitr::knit_exit()
+```
+
+```{r}
+# plot_data <- pop_all_species_seeds |>
+#   filter(seed == max(seed)) |> 
+#   filter(between(age, 4, 10)) |>
+#   summarise(
+#     mean_K = sum(K * N) / sum(N),
+#     mean_temp = mean(temp),
+#     .by = c(species, Fishing, Warming, year, scenario)
+#   )
+#
+# # # Plot K vs temp with regression lines
+# # plot_data |>
+# #   filter(Warming == "No") |>
+# #   ggplot(aes(mean_temp, mean_K, color = Warming)) +
+# #   geom_point(alpha = 0.5) +
+# #   geom_smooth(method = "lm", se = TRUE) +
+# #   facet_grid(Fishing ~ species, scales = "free") +
+# #   scale_color_brewer(palette = "Set1", direction = -1) +
+# #   labs(
+# #     x = "Temperature anomaly (°C)",
+# #     y = "Weighted mean K",
+# #     title = "Relationship between temperature and mean K"
+# #   ) +
+# #   theme(legend.position = "bottom")
+#
+# plot_data |>
+#   #filter(Fishing == "Fished" & Warming == "No") |>
+#   ggplot(aes(mean_temp, mean_K, color = species)) +
+#   geom_point(alpha = 0.5) +
+#   geom_smooth(method = "lm", se = TRUE) +
+#   facet_wrap(~scenario, scales = "free") +
+#   scale_color_brewer(palette = "Set1", direction = -1) +
+#   labs(
+#     x = "Temperature anomaly (°C)",
+#     y = "Weighted mean K"
+#   ) +
+#   theme(legend.position = "bottom")
+#
+#
+#
+# lm(mean_K ~ mean_temp, data = plot_data)
+#
+#
+# plot_data |>
+#   ggplot(aes(mean_K, fill = species)) +
+#   facet_wrap(~species, scales = "free") +
+#   geom_histogram()
+#
+# # Also plot K over time
+# plot_data |>
+#   #filter(Fishing == "Fished" & Warming == "No") |>
+#   ggplot(aes(year, mean_K, color = species)) +
+#   geom_point() +
+#   facet_wrap(~scenario, scales = "free") +
+#   labs(y = "Weighted mean K")
+
+# Parameters
+# n_years <- 50
+# deltaK_perC <- 0.05
+# total_warming <- 2
+#
+# # Calculate mean K by age over last 20 years
+# k_last_year <- pop_all_species |>
+#   filter(
+#     age > 1,
+#     year >= n_years - 20
+#   ) |>
+#   summarise(
+#     mean = sum(K * N) / sum(N),
+#     sd = sqrt(sum(N * (K - sum(K * N) / sum(N))^2) / sum(N)),
+#     totalN = sum(N),
+#     .by = c(species, Fishing, Warming, age)
+#   ) |>
+#   mutate(
+#     rel_abund = totalN / sum(totalN),
+#     .by = c(species, Fishing, Warming)
+#   )
+#
+# # Get expected K from life history table
+# expected_K <- life_history_table |>
+#   select(species, mean_K) |>
+#   rename(K_base = mean_K) |>
+#   mutate(K_end_warming = K_base + deltaK_perC * total_warming)
+#
+# # Create horizontal reference lines
+# vlines_K <- expected_K |>
+#   pivot_longer(
+#     cols = c(K_base, K_end_warming),
+#     names_to = "type",
+#     values_to = "K_line"
+#   ) |>
+#   mutate(Warming = if_else(type == "K_base", "No", "Yes")) |>
+#   select(species, Warming, K_line)
+#
+# # Plot
+# ggplot(k_last_year |> filter(age <= 10),
+#        aes(age, mean, color = Warming, size = rel_abund, shape = Fishing)) +
+#   geom_hline(
+#     data = vlines_K,
+#     aes(yintercept = K_line, color = Warming),
+#     linetype = 2, alpha = 0.8
+#   ) +
+#   geom_point(position = position_dodge(width = 0.2), alpha = 0.7) +
+#   facet_wrap(~species, scales = "free_y", nrow = 1) +
+#   scale_color_brewer(palette = "Set1", direction = -1) +
+#   scale_size_continuous(range = c(1, 7), name = "Relative\nabundance") +
+#   labs(x = "Age", y = "Growth coefficient (K)", color = "Warming") +
+#   theme(legend.position = "bottom")
+#
+# ggsave(paste0(home, "/figures/temperature_bias_age.pdf"),
+#        width = 25, height = 11, units = "cm")
+```
