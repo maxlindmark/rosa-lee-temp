@@ -24,11 +24,12 @@ In this script, we extend the basic model (rosa-lee-basic-example.qmd) and the t
 #| message: false
 #| warning: false
 
+library(dplyr)
+library(tidyr)
+library(ggplot2)
 library(viridis)
-library(ggdist)
 library(patchwork)
 library(viridis)
-library(tidyverse)
 library(ggsidekick)
 library(purrr)
 library(broom)
@@ -303,10 +304,6 @@ Plot temperature
 # Generate a bunch of temperature-series and plot as examples
 # TODO: maybe there should be an AR1 processes but I don't think that's necessary for this purpose...
 # but it would be realistic
-library(dplyr)
-library(tidyr)
-library(purrr)
-library(ggplot2)
 
 # Define seeds and total_warming values
 params <- tibble(
@@ -659,7 +656,7 @@ run_all_scenarios <- function(species = "cod",
   pop_all <- pop_all |>
     mutate(
       Warming = ifelse(str_detect(scenario, "NoWarming"), "No", "Yes"),
-      Fishing = ifelse(str_detect(scenario, "Unfished"), "No", "Yes")
+      Fishing = ifelse(str_detect(scenario, "UnFished"), "No", "Yes")
     )
 
   # Join appropriate temperature series based on scenario
@@ -703,15 +700,56 @@ pop_all_species_seeds <- map_dfr(species_list, function(species) {
 
 ```{r}
 # Calculate mean K by age, year, and temp
-# TODO: should I do sampling by age? not sure. This is in proportion to N
 
+# This is just the weighed mean, sample proporitonal to N
+# slopes <- pop_all_species_seeds |>
+#   filter(between(age, 4, 10)) |>
+#   summarise(
+#     K = sum(K * N) / sum(N),
+#     temp = mean(temp),
+#     .by = c(species, Fishing, Warming, year, scenario, seed)
+#   ) |>
+#   mutate(scenario = ifelse(str_detect(scenario, "ctrl"),
+#     scenario,
+#     paste0(scenario, "_exp")
+#   )) |>
+#   mutate(scenario = paste(scenario, species, seed, sep = "_")) %>%
+#   split(.$scenario) |>
+#   map_dfr(~ {
+#     fit <- lm(K ~ temp, data = .)
+#     # fit <- sdmTMB::sdmTMB(K ~ temp, data = ., spatial = "off", family = Gamma(link = "log"))
+#     tidy(fit) |> filter(term == "temp")
+#     # fit <- glmmTMB(mean_K ~ mean_temp, family = t_family, data = plot_data)
+#     # fixef(fit)$cond[2]
+#   }, .id = "scenario") |>
+#   separate(scenario, into = c("Fishing", "Warming", "type", "species", "seed"), sep = "_", remove = FALSE) |>
+#   mutate(scenario2 = paste(Fishing, Warming, type, species, sep = "_")) |>
+#   mutate(scenario3 = paste(Fishing, Warming, type, sep = "_")) |>
+#   mutate(
+#     Fishing = ifelse(Fishing == "UnFished", "No Fishing", "Fishing"),
+#     Warming = ifelse(Warming == "NoWarming", "No Warming", Warming)
+#   )
+
+# Here we sample a fixed number by age class. This more reflects how sampling is not, and gives less influence to changes in demography (age structure, but still accounts for platoon structure)
 slopes <- pop_all_species_seeds |>
-  filter(between(age, 4, 10)) |>
-  summarise(
-    K = sum(K * N) / sum(N),
-    temp = mean(temp),
-    .by = c(species, Fishing, Warming, year, scenario, seed)
-  ) |>
+  group_by(species, year, scenario, seed, age) |>
+  group_modify(~ {
+    # sampling probabilities within age
+    probs <- .x$N / sum(.x$N)
+
+    # draw equal number of individuals at this age
+    K_samp <- sample(
+      .x$K,
+      size = 1000,
+      replace = TRUE,
+      prob = probs
+    )
+
+    tibble(
+      K = mean(K_samp),
+      temp = mean(.x$temp)
+    )
+  }) |>
   mutate(scenario = ifelse(str_detect(scenario, "ctrl"),
     scenario,
     paste0(scenario, "_exp")
@@ -831,7 +869,7 @@ ggsave(paste0(home, "/figures/temperature_bias.pdf"),
 p1 <- life_history_table |> 
   dplyr::select(species, mean_K, Linf, t0) |> 
   mutate(k_true = mean_K + 0.025*2, 
-         k_bias = mean_K + 0.02*2) |> 
+         k_bias = mean_K + 0.0175*2) |> 
   crossing(age = seq(2, 10, length.out = 50)) |> 
   mutate(length_true = calc_length_at_age(age, Linf, k_true, t0),
          length_bias = calc_length_at_age(age, Linf, k_bias, t0)) |> 
@@ -854,7 +892,7 @@ p1 <- life_history_table |>
 p2 <- life_history_table |> 
   dplyr::select(species, mean_K, Linf, t0) |> 
   mutate(k_true = mean_K + 0.025*2, 
-         k_bias = mean_K + 0.02*2) |> 
+         k_bias = mean_K + 0.0175*2) |> 
   crossing(age = seq(1, 10, length.out = 50)) |> 
   mutate(length_true = calc_length_at_age(age, Linf, k_true, t0),
          length_bias = calc_length_at_age(age, Linf, k_bias, t0)) |> 
@@ -941,12 +979,31 @@ Plot how K and growth changes in the population (Rosa Lee effect!)
 # Filter data to last 10 years and relevant scenarios
 comparison_data <- pop_all_species_seeds |>
   filter(
-    seed == min(seed),
-    species %in% species_list,
     year >= n_years - 10,
-    scenario %in% c("Fished_NoWarming", "Unfished_NoWarming")
+    scenario %in% c("Fished_NoWarming", "UnFished_NoWarming")
   ) |>
   select(species, scenario, age, platoon, N, K, Fishing, Warming)
+
+# t <- pop_all_species_seeds |> 
+#   filter(species == "cod" & scenario == "Fished_NoWarming", age <= 10)
+# t2 <- t |> 
+#   summarise(
+#     k_wt = sum(K * N) / sum(N),
+#     km = mean(K),
+#     .by = c(age, year)
+#   )
+# ggplot(t2, aes(year, k_wt, color = as.factor(age))) + geom_line() + 
+#   facet_wrap(~age, scales = "free") +
+#   guides(color = "none")
+# t2 |> filter(year == 1)
+
+mean_k_yr1 <- pop_all_species_seeds |> 
+  filter(year == 1 & scenario %in% c("Fished_NoWarming")) |> 
+  # Compare to first year of fishing instead of the mean in the parameter distribution
+  # If comparing against mean in distribution it can look like it's increasesing in the unfished scenario
+  summarise(mean_K = mean(K), .by = species) |> 
+  mutate(facet_species = str_to_sentence(species),
+         label = letters[1:3])
 
 # Plot K in fished scenario by age relative to baseline
 k_dat <- comparison_data |>
@@ -956,31 +1013,29 @@ k_dat <- comparison_data |>
     K_sd = sqrt(sum(N * (K - sum(K * N) / sum(N))^2) / sum(N)),
     .by = c(species, age)
   ) |>
-  left_join(
-    life_history_table |> select(species, mean_K),
-    by = "species"
-  ) |>
+  # left_join(
+  #   life_history_table |> select(species, mean_K),
+  #   by = "species"
+  # ) |>
   mutate(
     facet_species = str_to_sentence(species),
     mean = K_weighted,
     ymin = K_weighted - K_sd,
     ymax = K_weighted + K_sd
-  ) |>
-  select(facet_species, age, mean, ymin, ymax)
+  )
 
 labs_p1 <- data.frame(
   facet_species = c("Cod", "Flatfish", "Sardine"),
   label = letters[1:3]
 )
 
-p1 <- ggplot() +
+p1 <- ggplot(k_dat) +
   geom_hline(
-    data = distinct(k_dist_all, facet_species, mean_K),
+    data = mean_k_yr1, 
     aes(yintercept = mean_K),
     linetype = 2, alpha = 0.7
   ) +
   geom_pointrange(
-    data = p1_data,
     aes(as.factor(age), mean, ymin = ymin, ymax = ymax),
     color = "grey20", alpha = 0.7
   ) +
@@ -1012,7 +1067,8 @@ mean_growth_all <- comparison_data |>
   ) |>
   mutate(
     length = calc_length_at_age(age, Linf, K_weighted, t0),
-    facet_species = str_to_sentence(species)
+    facet_species = str_to_sentence(species),
+    Fishing = ifelse(Fishing == "Yes", "Fished", "Unfished")
   )
 
 labs_p2 <- data.frame(
@@ -1022,8 +1078,7 @@ labs_p2 <- data.frame(
 
 p2 <- ggplot(
   mean_growth_all,
-  aes(age, length, color = Fishing)
-) +
+  aes(age, length, color = Fishing)) +
   geom_line() +
   facet_wrap(~facet_species, scales = "free", ncol = 3) +
   labs(x = "Age", y = "Length (cm)") +
@@ -1058,8 +1113,7 @@ labs_p3 <- data.frame(
 
 p3 <- ggplot(
   growth_diff,
-  aes(age, diff_length)
-) +
+  aes(age, diff_length)) +
   geom_line(color = "grey20") +
   geom_hline(yintercept = 0, linetype = 2, alpha = 0.7) +
   facet_wrap(~facet_species, scales = "free", ncol = 3) +
@@ -1078,20 +1132,19 @@ p3 <- ggplot(
 ggsave(paste0(home, "/figures/rosa_lee_all_species.pdf"),
   width = 20, height = 16, units = "cm"
 )
-
-# FIXME: test against true or data in unfished?
 ```
 
 ### Run specific scenarios and vary parameters
 
 ```{r}
 # Function to run a subset of scenarios ...
-# TODO maybe the full function shouldnt hardcode scenarios .... could be input
+
 run_specific_scenarios <- function(species = "cod",
                                    total_warming = 2,
                                    F_longterm = 0.4,
                                    seed = 99,
                                    ...) {
+  
   temp_warming <- make_temp_series(n_years, total_warming = total_warming, seed = seed)
 
   scenarios <- list(
@@ -1144,8 +1197,8 @@ run_specific_scenarios <- function(species = "cod",
 
 # Define parameter ranges to run
 # 1000 iterations takes 5.65 h
-warming_values <- seq(0, 2, length.out = 15)
-F_values <- seq(0, 0.4, length.out = 15)
+warming_values <- seq(0, 2, length.out = 10)
+F_values <- seq(0, 0.4, length.out = 10)
 n_seeds <- 30
 
 # Create grid of parameters (without seed)
@@ -1190,20 +1243,32 @@ results_all_params <- map_dfr(1:nrow(param_grid), function(i) {
       mutate(species = .x)
   )
 
-  # Add the parameter values as columns; summarise to not create massive DF's
-  # Summarise across by seed, year, species, scenario.
+  # Calculate weighted K within each age, then equal weight across ages
   pop_all_species |>
-    mutate(seed = seed_val) |>
-    filter(between(age, 4, 10)) |>
-    summarise(
-      K = sum(K * N) / sum(N),
-      temp = mean(temp),
-      .by = c(species, year, scenario, seed)
-    ) |>
-    mutate(
-      total_warming = warming,
-      F_longterm = F_val
+  mutate(seed = seed_val) |>
+  group_by(species, year, scenario, seed, age) |>
+  group_modify(~ {
+    # sampling probabilities within age
+    probs <- .x$N / sum(.x$N)
+
+    # draw equal number of individuals at this age
+    K_samp <- sample(
+      .x$K,
+      size = 1000,
+      replace = TRUE,
+      prob = probs
     )
+
+    tibble(
+      K = mean(K_samp),
+      temp = mean(.x$temp)
+    )
+  }) |>
+  ungroup() |>
+  mutate(
+    total_warming = warming,
+    F_longterm = F_val
+  )
 })
 toc()
 
@@ -1234,56 +1299,7 @@ write_csv(slopes_by_par, paste0(home, "/output/slopes_by_par.csv"))
 slopes_by_par <- read_csv(paste0(home, "/output/slopes_by_par.csv"))
 
 deltaK_perC <- 0.025
-
-#pal <- brewer.pal(11, "RdYlGn")
-pal <- brewer.pal(11, "RdYlBu")
-
-### test
-#t <- read_csv(paste0(home, "/output/results_all_params.csv"))
-# 
-# slopes_by_par |>
-#   filter(total_warming == min(total_warming) & scenario == "Fished_Warming_full") |>
-#   ggplot(aes(F_longterm, estimate, color = as.factor(seed))) +
-#   facet_wrap(~species) +
-#   geom_point()
-# 
-# t |>
-#   filter(total_warming == min(total_warming) & scenario == "Fished_Warming_full") |>
-#   ggplot(aes(F_longterm, K, color = species)) +
-#   geom_smooth(method = "lm") +
-#   geom_point()
-# 
-# t |>
-#   filter(total_warming == min(total_warming) & scenario == "Fished_Warming_full") |>
-#   ggplot(aes(year, K, color = species)) +
-#   facet_wrap(~F_longterm) +
-#   geom_point(alpha = 0.2) +
-#   geom_smooth(method = "lm")
-# 
-# t |>
-#   filter(total_warming == min(total_warming) & scenario == "Fished_Warming_full") |>
-#   ggplot(aes(year, K, color = as.factor(F_longterm))) +
-#   #facet_wrap(~F_longterm) +
-#   #geom_point(alpha = 0.2) +
-#   geom_smooth(method = "lm")
-# 
-# t |>
-#   filter(total_warming == min(total_warming) & scenario == "Fished_Warming_full") |>
-#   ggplot(aes(temp, K, color = as.factor(F_longterm))) +
-#   #facet_wrap(~F_longterm) +
-#   #geom_point(alpha = 0.2) +
-#   geom_smooth(method = "lm")
-# t |> 
-#   filter(total_warming == max(total_warming) & scenario == "Fished_Warming_full") |> 
-#   ggplot(aes(year, temp)) + 
-#   facet_wrap(~species) +
-#   geom_point(alpha = 0.2) + 
-#   geom_smooth(method = "lm")
-
-# Do I need to control for year? I think from these plots that the hard decline in high F leads to a steeper decline in K over time. 
-
-# Also I doubt this is significant... (!)
-###
+pal <- brewer.pal(n = 10, "RdYlBu")
 
 # egg::tag_facet over-plots with facet_grid i think, switching to manual labelling
 labels <- slopes_by_par |>
@@ -1321,10 +1337,157 @@ slopes_by_par |>
 ggsave(paste0(home, "/figures/bias_temp_f.pdf"),
   width = 18, height = 10, units = "cm"
 )
+
 ```
 
 ```{r}
 knitr::knit_exit()
+```
+
+```{r test}
+## test
+# Define parameter ranges to run
+# 1000 iterations takes 5.65 h
+warming_values <- 0#seq(0, length.out = 15)
+F_values <- seq(0, 0.4, length.out = 5)
+n_seeds <- 20
+
+# Create grid of parameters (without seed)
+param_combinations <- expand_grid(
+  total_warming = warming_values,
+  F_longterm = F_values
+)
+
+# Add unique seeds to each combination
+param_grid <- param_combinations |>
+  mutate(combo_id = row_number()) |>
+  crossing(rep_id = 1:n_seeds) |>
+  mutate(seed = (combo_id - 1) * n_seeds + rep_id) |>
+  select(total_warming, F_longterm, seed)
+
+nrow(param_grid)
+
+species_list <- c("cod", "flatfish", "sardine")
+
+tic()
+results_all_params_test <- map_dfr(1:nrow(param_grid), function(i) {
+  warming <- param_grid$total_warming[i]
+  F_val <- param_grid$F_longterm[i]
+  seed_val <- param_grid$seed[i]
+
+  cat(
+    "Running simulation", i, "of", nrow(param_grid),
+    ": total_warming =", warming,
+    ", F_longterm =", F_val,
+    ", seed =", seed_val, "\n"
+  )
+
+  # Run for all species using the simpler function
+  pop_all_species <- map_dfr(
+    species_list,
+    ~ run_specific_scenarios(
+      species = .x,
+      total_warming = warming,
+      F_longterm = F_val,
+      seed = seed_val
+    )$pop_all |>
+      mutate(species = .x)
+  )
+
+  # Calculate weighted K within each age, then equal weight across ages
+  pop_all_species |>
+  mutate(seed = seed_val) |>
+  group_by(species, year, scenario, seed, age) |>
+  group_modify(~ {
+    # sampling probabilities within age
+    probs <- .x$N / sum(.x$N)
+
+    # draw equal number of individuals at this age
+    K_samp <- sample(
+      .x$K,
+      size = 200,
+      replace = TRUE,
+      prob = probs
+    )
+
+    tibble(
+      K = mean(K_samp),
+      temp = mean(.x$temp)
+    )
+  }) |>
+  ungroup() |>
+  mutate(
+    total_warming = warming,
+    F_longterm = F_val
+  )
+  
+})
+toc()
+
+###
+slopes <- results_all_params_test |>
+  mutate(scenario = paste(species, F_longterm, total_warming, scenario, seed, sep = "-")) %>%
+  split(.$scenario) |>
+  map_dfr(~ {
+    fit <- lm(K ~ temp, data = .)
+    tidy(fit) |> filter(term == "temp")
+  }, .id = "scenario") |>
+  separate(scenario,
+    into = c("species", "F_longterm", "total_warming", "scenario", "seed"),
+    sep = "-", remove = FALSE
+  )
+
+slopes |>
+  filter(total_warming == min(total_warming) & scenario == "Fished_Warming_full") |>
+  summarise(mean = mean(estimate), .by = c(species, F_longterm, seed)) |>
+  ggplot(aes(as.numeric(F_longterm), mean)) +
+  facet_wrap(~species) +
+  geom_smooth(method = "lm") +
+  geom_jitter(height = 0, width = 0.05) +
+  geom_hline(yintercept = 0.025, lty = 2) +
+  geom_vline(xintercept = 0.025, lty = 2)
+
+slopes |>
+  filter(total_warming == min(total_warming) & scenario == "Fished_Warming_full") |>
+  summarise(mean = mean(estimate), .by = c(species, F_longterm)) |>
+  ggplot(aes(as.numeric(F_longterm), mean)) +
+  facet_wrap(~species) +
+  geom_jitter(height = 0, width = 0.05) +
+  geom_smooth(method = "lm") +
+  geom_hline(yintercept = 0.025, lty = 2) +
+  geom_vline(xintercept = 0.025, lty = 2) +
+  NULL
+
+# p1
+# p2
+slopes |>
+  filter(total_warming == min(total_warming)) |> 
+  summarise(
+    estimate = mean(estimate),
+    sd = sd(estimate, na.rm = TRUE),
+    .by = c(species, F_longterm, total_warming, scenario)
+  ) |>
+  filter(scenario %in% c("Fished_Warming_noRL", "Fished_Warming_full")) |>
+  mutate(facet = ifelse(scenario == "Fished_Warming_noRL", "No Rosa Lee", "With Rosa Lee")) |>
+  ggplot(aes(F_longterm, estimate, color = str_to_sentence(species)),
+         linetype = str_to_sentence(species)) +
+  #geom_line() +
+  geom_point() +
+  geom_errorbar(aes(ymin = estimate - sd, ymax = estimate + sd)) +
+  labs(
+    x = "Long term F",
+    y = "Warming per century (°C)",
+    fill = "Estimate"
+  ) +
+  facet_wrap(~facet) +
+  scale_fill_gradient2(low = pal[2], high = pal[length(pal) - 1], midpoint = deltaK_perC) +
+  geom_text(aes(label = label, x = -Inf, y = Inf),
+    hjust = -0.5, vjust = 1.5, size = 4, color = "grey30",
+    inherit.aes = FALSE,
+    data = labels
+  ) +
+  theme(legend.position = "bottom")
+
 ```
 
 ```{r}
